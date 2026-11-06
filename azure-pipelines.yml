@@ -115,8 +115,10 @@ stages:
         displayName: 'Desplegar en OpenShift'
         steps:
           - script: |
+              set -euo pipefail
+
               echo "=== 1. Descargando e instalando OpenShift CLI (oc) ==="
-              curl -LO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz
+              curl -sLO https://mirror.openshift.com/pub/openshift-v4/clients/ocp/stable/openshift-client-linux.tar.gz
               tar -xzf openshift-client-linux.tar.gz
               sudo mv oc /usr/local/bin/
 
@@ -142,20 +144,81 @@ stages:
               oc rollout status deployment/jee-msa-web-demo-pipeline
 
               echo "=== 8. Obteniendo URL de la Aplicación ==="
-              oc get route jee-msa-web-demo-pipeline -o jsonpath='{"URL: http://"}{.spec.host}{"\n"}'
+              APP_HOST=$(oc get route jee-msa-web-demo-pipeline -o jsonpath='{.spec.host}')
+              APP_URL="http://${APP_HOST}"
+              echo "URL: ${APP_URL}"
+              echo "##vso[task.setvariable variable=APP_URL;isOutput=true]${APP_URL}"
+            name: deploy
             displayName: 'Descarga CLI, Login y Despliegue Docker'
 
   # ==========================================
-  # STAGE 4: NOTIFICACIONES (NOTIFICATIONS)
+  # STAGE 4: POD REQUEST (SMOKE TEST)
+  # ==========================================
+  - stage: PodRequest
+    displayName: 'Pod Request'
+    dependsOn: CD
+    condition: succeeded()
+    variables:
+      APP_URL: $[ stageDependencies.CD.deploy_openshift.outputs['deploy.APP_URL'] ]
+    jobs:
+      - job: status_check
+        displayName: 'Validar /api/status'
+        steps:
+          - checkout: none
+          - script: |
+              set -uo pipefail
+              ENDPOINT="${APP_URL}/api/status"
+              MAX_RETRIES=10
+              SLEEP_SECONDS=10
+
+              echo "Endpoint: ${ENDPOINT}"
+
+              for i in $(seq 1 ${MAX_RETRIES}); do
+                RESPONSE=$(curl -s -w '\n%{http_code}' --max-time 15 "${ENDPOINT}" || true)
+                HTTP_CODE=$(echo "${RESPONSE}" | tail -n1)
+                BODY=$(echo "${RESPONSE}" | sed '$d')
+                STATUS=$(echo "${BODY}" | jq -r '.status // empty' 2>/dev/null || true)
+
+                echo "Intento ${i}/${MAX_RETRIES} -> HTTP ${HTTP_CODE} | status=${STATUS:-N/A}"
+
+                if [ "${HTTP_CODE}" = "200" ] && [ "${STATUS}" = "UP" ]; then
+                  echo "##[section]Respuesta: ${BODY}"
+                  echo "##[section]ESTADO DE LA APLICACIÓN: ${STATUS}"
+
+                  {
+                    echo "## Pod Request"
+                    echo "| Campo | Valor |"
+                    echo "|---|---|"
+                    echo "| Endpoint | ${ENDPOINT} |"
+                    echo "| HTTP | ${HTTP_CODE} |"
+                    echo "| Status | **${STATUS}** |"
+                    echo "| Environment | $(echo "${BODY}" | jq -r '.environment') |"
+                    echo "| Message | $(echo "${BODY}" | jq -r '.message') |"
+                  } > "$(Agent.TempDirectory)/pod-status.md"
+                  echo "##vso[task.uploadsummary]$(Agent.TempDirectory)/pod-status.md"
+                  exit 0
+                fi
+
+                sleep ${SLEEP_SECONDS}
+              done
+
+              echo "##vso[task.logissue type=error]La aplicación no respondió status=UP en ${ENDPOINT}"
+              echo "Última respuesta: ${BODY:-<vacía>}"
+              exit 1
+            displayName: 'Llamar /api/status y validar UP'
+
+  # ==========================================
+  # STAGE 5: NOTIFICACIONES (NOTIFICATIONS)
   # ==========================================
   - stage: Notifications
     displayName: 'Notificar'
-    dependsOn: [CI, Approval, CD]
+    dependsOn: [CI, Approval, CD, PodRequest]
     condition: always()
     jobs:
       - job: send_status_email
         displayName: 'Enviar Reporte'
         steps:
+          - checkout: none
           - script: |
               echo "Estado final de la ejecución del pipeline construido por Jeferson Villacís: $(Agent.JobStatus)"
             displayName: 'Simulación de Envío de Correo Electrónico'
